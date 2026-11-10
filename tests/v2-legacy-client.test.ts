@@ -7,7 +7,8 @@ import {
 } from "../src/v2/legacy-client.js";
 
 function createContext(overrides: Record<string, unknown> = {}) {
-  return {
+  let createdSessions = 0;
+  const context: any = {
     location: {
       directory: "/workspace/project",
       project: { id: "project", directory: "/workspace/project", canonical: "project" },
@@ -33,18 +34,35 @@ function createContext(overrides: Record<string, unknown> = {}) {
         ],
       }),
     },
-    generate: {
+    // Fake model behind session.generate: receives the prompt and the model
+    // last set on the session via switchModel.
+    modelReply: {
       text: async () => ({ text: '{"summary":"done","tags":["v2"]}' }),
     },
+    sessionModels: new Map<string, unknown>(),
+    removedSessions: [] as string[],
     session: {
       get: async () => ({ id: "ses", location: { directory: "/workspace/project" } }),
       context: async () => [],
       synthetic: async (input: unknown) => input,
       prompt: async (input: unknown) => input,
       interrupt: async () => ({ interrupted: true }),
+      create: async () => ({ id: `ses_tmp_${++createdSessions}` }),
+      switchModel: async (input: any) => {
+        context.sessionModels.set(input.sessionID, input.model);
+      },
+      generate: async (input: any) =>
+        context.modelReply.text({
+          prompt: input.prompt,
+          model: context.sessionModels.get(input.sessionID),
+        }),
+      remove: async (input: any) => {
+        context.removedSessions.push(input.sessionID);
+      },
     },
     ...overrides,
-  } as any;
+  };
+  return context;
 }
 
 describe("OpenCode v2 legacy client bridge", () => {
@@ -67,7 +85,7 @@ describe("OpenCode v2 legacy client bridge", () => {
   it("preserves create/prompt/delete structured-output semantics", async () => {
     let generationInput: any;
     const ctx = createContext({
-      generate: {
+      modelReply: {
         text: async (input: any) => {
           generationInput = input;
           return { text: '```json\n{"summary":"done","tags":["v2"]}\n```' };
@@ -103,10 +121,34 @@ describe("OpenCode v2 legacy client bridge", () => {
     expect((await client.session.delete({ sessionID })).data).toBe(true);
   });
 
-  it("forwards the prompt body variant into ctx.generate.text model and omits it when unset", async () => {
-    const generationInputs: any[] = [];
+  it("generates in a temporary session, not the sessionless Generate API, and removes it on delete", async () => {
     const ctx = createContext({
       generate: {
+        text: async () => {
+          throw new Error("sessionless ctx.generate.text must not be called");
+        },
+      },
+    });
+    const client = createLegacyClient(ctx);
+
+    const sessionID = (await client.session.create({ title: "capture" })).data.id;
+    const result = await client.session.prompt({
+      sessionID,
+      model: { providerID: "anthropic", modelID: "claude" },
+      parts: [{ type: "text", text: "Analyze." }],
+      format: { type: "json_schema", schema: { type: "object" } },
+    });
+    await client.session.delete({ sessionID });
+
+    expect(ctx.sessionModels.get(sessionID)).toEqual({ providerID: "anthropic", id: "claude" });
+    expect(result.data.info.structured_output).toEqual({ summary: "done", tags: ["v2"] });
+    expect(ctx.removedSessions).toEqual([sessionID]);
+  });
+
+  it("forwards the prompt body variant into the session model and omits it when unset", async () => {
+    const generationInputs: any[] = [];
+    const ctx = createContext({
+      modelReply: {
         text: async (input: any) => {
           generationInputs.push(input);
           return { text: '{"summary":"done","tags":["v2"]}' };
@@ -145,7 +187,7 @@ describe("OpenCode v2 legacy client bridge", () => {
   it("json_schema prompts state that no tools are available and only JSON may be returned", async () => {
     let generationPrompt = "";
     const ctx = createContext({
-      generate: {
+      modelReply: {
         text: async (input: any) => {
           generationPrompt = input.prompt;
           return { text: '{"summary":"done","tags":["v2"]}' };
@@ -167,7 +209,7 @@ describe("OpenCode v2 legacy client bridge", () => {
       },
     });
 
-    // The v2 Generate API has no tools; the instruction must come after the
+    // Session generation exposes no tools; the instruction must come after the
     // system/user text and forbid tool use so obedient models answer with JSON.
     expect(generationPrompt).toContain("No tools are available");
     expect(generationPrompt.indexOf("No tools are available")).toBeGreaterThan(
@@ -180,7 +222,7 @@ describe("OpenCode v2 legacy client bridge", () => {
   it("text prompts without a json_schema format stay unchanged", async () => {
     let generationPrompt = "";
     const ctx = createContext({
-      generate: {
+      modelReply: {
         text: async (input: any) => {
           generationPrompt = input.prompt;
           return { text: "ok" };
@@ -205,7 +247,7 @@ describe("OpenCode v2 legacy client bridge", () => {
 
   it("recovers structured output from a fenced ```json block after leading prose", async () => {
     const ctx = createContext({
-      generate: {
+      modelReply: {
         text: async () => ({
           text: 'I\'ll analyze these prompts first.\n\n```json\n{"summary":"done","tags":["v2"]}\n```\n\nDone.',
         }),
@@ -234,7 +276,7 @@ describe("OpenCode v2 legacy client bridge", () => {
 
   it("recovers structured output from leading prose without fences", async () => {
     const ctx = createContext({
-      generate: {
+      modelReply: {
         text: async () => ({
           text: 'Let me load the profile update tool first.\n\n{"summary":"done","tags":["v2"]}',
         }),
@@ -263,7 +305,7 @@ describe("OpenCode v2 legacy client bridge", () => {
 
   it("recovers the last balanced top-level object when several are present", async () => {
     const ctx = createContext({
-      generate: {
+      modelReply: {
         text: async () => ({
           text: 'Preamble {"summary":"stub","tags":["example"]} {"summary":"done","tags":["v2"]}',
         }),
@@ -292,7 +334,7 @@ describe("OpenCode v2 legacy client bridge", () => {
 
   it("skips an unparseable balanced span and recovers a later object", async () => {
     const ctx = createContext({
-      generate: {
+      modelReply: {
         text: async () => ({
           text: 'Bad {summary: broken} then {"summary":"done","tags":["v2"]}',
         }),
@@ -321,7 +363,7 @@ describe("OpenCode v2 legacy client bridge", () => {
 
   it("still yields no structured output when the reply is garbage", async () => {
     const ctx = createContext({
-      generate: {
+      modelReply: {
         text: async () => ({ text: "I cannot answer that in JSON, sorry." }),
       },
     });

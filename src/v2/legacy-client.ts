@@ -278,12 +278,12 @@ export function createLegacyClient(ctx: Context, toastRpc?: ToastEmitter) {
         };
       },
       create: async () => {
-        // OpenCode v2's plugin Generate API is intentionally sessionless.
-        // Keep a synthetic id so the existing structured-output lifecycle can
-        // retain its create/prompt/delete contract without polluting history.
-        const id = randomUUID();
-        generatedSessions.add(id);
-        return { data: { id } };
+        // Generate inside a real temporary session rather than the sessionless
+        // ctx.generate.text: provider auth plugins (e.g. Claude OAuth) only
+        // hook session requests, so the sessionless path is rejected (429).
+        const session = await ctx.session.create({ title: "opencode-mem structured output" });
+        generatedSessions.add(session.id);
+        return { data: { id: session.id } };
       },
       prompt: async (input: any) => {
         const sessionID = sessionIDFrom(input);
@@ -297,17 +297,15 @@ export function createLegacyClient(ctx: Context, toastRpc?: ToastEmitter) {
                   providerID: body.model.providerID,
                   id: body.model.modelID,
                   // V1 prompt bodies carry the variant as a sibling of `model`
-                  // (SessionPromptData.body.variant); the V2 Generate API
+                  // (SessionPromptData.body.variant); the V2 model ref
                   // takes it inside the model object.
                   ...(typeof body.variant === "string" && body.variant
                     ? { variant: body.variant }
                     : {}),
                 }
               : undefined;
-          const generated = await ctx.generate.text({
-            prompt: schemaPrompt(body),
-            ...(model ? { model } : {}),
-          });
+          if (model) await ctx.session.switchModel({ sessionID, model });
+          const generated = await ctx.session.generate({ sessionID, prompt: schemaPrompt(body) });
           const text = generated?.text ?? "";
           const structured = body.format?.type === "json_schema" ? parseJson(text) : undefined;
           return {
@@ -343,10 +341,6 @@ export function createLegacyClient(ctx: Context, toastRpc?: ToastEmitter) {
       },
       abort: async (input: any) => {
         const sessionID = sessionIDFrom(input);
-        if (sessionID && generatedSessions.has(sessionID)) {
-          generatedSessions.delete(sessionID);
-          return { data: true };
-        }
         if (sessionID) {
           const result = await ctx.session.interrupt({ sessionID });
           return { data: result.interrupted };
@@ -355,7 +349,9 @@ export function createLegacyClient(ctx: Context, toastRpc?: ToastEmitter) {
       },
       delete: async (input: any) => {
         const sessionID = sessionIDFrom(input);
-        if (sessionID) generatedSessions.delete(sessionID);
+        if (sessionID && generatedSessions.delete(sessionID)) {
+          await ctx.session.remove({ sessionID });
+        }
         return { data: true };
       },
     },
